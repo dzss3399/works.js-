@@ -410,19 +410,22 @@ const dohDnsHandler = async (payload) => {
     return packet;
 };
 const calculateBufferSize = (speed) => {
-    if (speed === 0) return {newbufferSize: bufferSize, newflushTime: flushTime};
-    const speedBps = speed * 1048576;
-    const initSize = (speedBps * flushTime) / 1000;
-    if (initSize < 20480) return {newbufferSize: 20480, newflushTime: Math.ceil((20480 * 1000) / speedBps)};
-    const finalSize = Math.floor(Math.min(initSize, 16777216));
-    return {newbufferSize: finalSize, newflushTime: flushTime};
+    if (speed === 0) return {newSize: bufferSize, newTime: flushTime};
+    const targetBps = speed * 1048576;
+    const initSize = (targetBps * 100) / 1000;
+    let newSize;
+    let newTime = (initSize < 20480) ? Math.ceil((20480 * 1000) / targetBps) : (initSize > 4194304) ? Math.ceil((4194304 * 1000) / targetBps) : 100;
+    if (newTime > 100) newTime = 100;
+    newSize = Math.ceil(((targetBps * newTime) / 1000) / 4096) * 4096;
+    if (newSize > 4194304) newSize = 4194304;
+    return {newSize, newTime};
 };
 const streamPipe = (initialChunk, speed) => {
-    const {newbufferSize, newflushTime} = calculateBufferSize(speed);
-    const safeBufferSize = newbufferSize - 4096;
-    let buffer = new Uint8Array(newbufferSize), offset = 0, timerId = null, resume = null;
+    const {newSize, newTime} = calculateBufferSize(speed);
+    const safeBufferSize = newSize - 4096;
+    let buffer = new Uint8Array(newSize), offset = 0, timerId = null, resume = null;
     const flushBuffer = (controller) => {
-        offset > 0 && (controller.enqueue(buffer.subarray(0, offset)), buffer = new Uint8Array(newbufferSize), offset = 0);
+        offset > 0 && (controller.enqueue(buffer.subarray(0, offset)), buffer = new Uint8Array(newSize), offset = 0);
         timerId && (clearTimeout(timerId), timerId = null), resume?.(), resume = null;
     };
     return new TransformStream({
@@ -434,7 +437,7 @@ const streamPipe = (initialChunk, speed) => {
             } else {
                 buffer.set(chunk, offset);
                 offset += chunk.length;
-                timerId || (timerId = setTimeout(() => flushBuffer(controller), newflushTime));
+                timerId || (timerId = setTimeout(() => flushBuffer(controller), newTime));
                 if (offset > safeBufferSize) return new Promise(resolve => resume = resolve);
             }
         },
@@ -444,29 +447,32 @@ const streamPipe = (initialChunk, speed) => {
 const manualPipe = async (readable, writable, initialChunk, userCache, speed) => {
     if (initialChunk?.byteLength > 0) writable.send(initialChunk);
     if (!userCache) {
-        for await (const chunk of readable) writable.send(chunk)
+        for await (const chunk of readable) writable.send(chunk);
         return;
     }
-    const {newbufferSize, newflushTime} = calculateBufferSize(speed);
-    const safeBufferSize = newbufferSize - 4096;
-    let buffer = new Uint8Array(newbufferSize), offset = 0, timerId = null, resume = null;
+    const {newSize, newTime} = calculateBufferSize(speed);
+    const safeBufferSize = newSize - 4096;
+    let buffer = new Uint8Array(newSize), offset = 0, timerId = null, resume = null;
     const flushBuffer = () => {
-        offset > 0 && (writable.send(buffer.subarray(0, offset)), buffer = new Uint8Array(newbufferSize), offset = 0);
+        offset > 0 && (writable.send(buffer.subarray(0, offset)), buffer = new Uint8Array(newSize), offset = 0);
         timerId && (clearTimeout(timerId), timerId = null), resume?.(), resume = null;
     };
+    const reader = readable.getReader();
     try {
-        for await (const chunk of readable) {
+        while (true) {
+            const {done, value: chunk} = await reader.read();
+            if (done) break;
             if (chunk.length < 4096) {
                 flushBuffer();
                 writable.send(chunk);
             } else {
                 buffer.set(chunk, offset);
                 offset += chunk.length;
-                timerId || (timerId = setTimeout(flushBuffer, newflushTime));
+                timerId || (timerId = setTimeout(flushBuffer, newTime));
                 if (offset > safeBufferSize) await new Promise(resolve => resume = resolve);
             }
         }
-    } finally {flushBuffer()}
+    } finally {flushBuffer(), reader.releaseLock()}
 };
 const handleWebSocketConn = async (webSocket, request) => {
     const protocolHeader = request.headers.get('sec-websocket-protocol');
@@ -480,7 +486,7 @@ const handleWebSocketConn = async (webSocket, request) => {
         cancel() {if (!earlyData) webSocket.close()}
     });
     let messageHandler, tcpSocket, wsUserCache, wsUserPipe, speed;
-    const closeSocket = () => {if (!earlyData) {tcpSocket?.close(), webSocket?.close()}}
+    const closeSocket = () => {if (!earlyData) {tcpSocket?.close(), webSocket?.close()}};
     webSocketStream.pipeTo(new WritableStream({
         async write(chunk) {
             if (messageHandler) return messageHandler(chunk);
